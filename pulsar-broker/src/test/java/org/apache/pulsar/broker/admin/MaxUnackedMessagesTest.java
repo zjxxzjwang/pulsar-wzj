@@ -127,23 +127,51 @@ public class MaxUnackedMessagesTest extends SharedPulsarBaseTest {
             // try to consume remaining messages
             Set<MessageId> result = ConcurrentHashMap.newKeySet();
             int expectedRemainingMessages = totalProducedMsgs - messages.size();
-            CountDownLatch latch = new CountDownLatch(expectedRemainingMessages);
-            for (int i = 0; i < consumers.size(); i++) {
-                final int consumerCount = i;
-                for (int j = 0; j < totalProducedMsgs; j++) {
-                    consumers.get(i).receiveAsync().thenAccept(m -> {
-                        result.add(m.getMessageId());
+
+            // Use a blocking receive loop per consumer so we only issue bounded receives
+            // (previously this spun up 3 * totalProducedMsgs async futures which would never
+            // all complete and could leak after consumers were closed).
+            List<Thread> drainers = new ArrayList<>(consumers.size());
+            for (Consumer<?> c : consumers) {
+                Thread t = new Thread(() -> {
+                    while (result.size() < expectedRemainingMessages
+                            && !Thread.currentThread().isInterrupted()) {
                         try {
-                            consumers.get(consumerCount).acknowledge(m);
-                        } catch (PulsarClientException e) {
-                            fail("failed to ack msg", e);
+                            Message<?> m = c.receive(500, TimeUnit.MILLISECONDS);
+                            if (m == null) {
+                                continue;
+                            }
+                            result.add(m.getMessageId());
+                            try {
+                                c.acknowledge(m);
+                            } catch (PulsarClientException ignore) {
+                                // Consumer may be closed when the test is finishing.
+                            }
+                        } catch (PulsarClientException ignore) {
+                            return;
                         }
-                        latch.countDown();
-                    });
-                }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                drainers.add(t);
             }
 
-            latch.await(10, TimeUnit.SECONDS);
+            try {
+                // Wait until all unique remaining messages have been received and acked.
+                // Previously a CountDownLatch counted every receive (including duplicates
+                // triggered by redelivery under Shared subscription) which caused the latch
+                // to drop to 0 before `result` finished collecting, leading to flaky asserts.
+                Awaitility.await()
+                        .atMost(20, TimeUnit.SECONDS)
+                        .pollInterval(100, TimeUnit.MILLISECONDS)
+                        .until(() -> result.size() >= expectedRemainingMessages);
+            } finally {
+                drainers.forEach(Thread::interrupt);
+                for (Thread t : drainers) {
+                    t.join(TimeUnit.SECONDS.toMillis(2));
+                }
+            }
 
             // total received-messages should match to produced messages (it may have duplicate messages)
             assertEquals(result.size(), expectedRemainingMessages);
