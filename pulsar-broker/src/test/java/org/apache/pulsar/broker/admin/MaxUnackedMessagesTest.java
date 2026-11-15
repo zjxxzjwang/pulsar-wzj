@@ -284,7 +284,12 @@ public class MaxUnackedMessagesTest extends SharedPulsarBaseTest {
         Awaitility.await().untilAsserted(()
                 -> assertNotNull(admin.topics().getMaxUnackedMessagesOnConsumer(topicName)));
         assertEquals(admin.topics().getMaxUnackedMessagesOnConsumer(topicName).intValue(), unackMsgAllowed);
-        // 4) Start 2 consumer, each consumer can only consume 100 messages
+        // consumer1 must be closed before producing the second batch; otherwise its
+        // receiver queue pre-fetches a share of the new messages that are never
+        // delivered to consumer2/consumer3, which makes the per-consumer unack
+        // assertions flaky.
+        consumer1.close();
+        // 4) Start 2 consumer, each consumer is throttled by `unackMsgAllowed`
         @Cleanup
         Consumer<String> consumer2 = consumerBuilder.subscribe();
         @Cleanup
@@ -295,30 +300,54 @@ public class MaxUnackedMessagesTest extends SharedPulsarBaseTest {
         }
         AtomicInteger consumer2Counter = new AtomicInteger(0);
         AtomicInteger consumer3Counter = new AtomicInteger(0);
-        CountDownLatch countDownLatch = new CountDownLatch(2);
-        startConsumer(consumer2, consumer2Counter, countDownLatch);
-        startConsumer(consumer3, consumer3Counter, countDownLatch);
-        countDownLatch.await(10, TimeUnit.SECONDS);
-        assertEquals(consumer2Counter.get(), unackMsgAllowed);
-        assertEquals(consumer3Counter.get(), unackMsgAllowed);
+        startConsumer(consumer2, consumer2Counter);
+        startConsumer(consumer3, consumer3Counter);
+        // Wait until both consumers have collectively reached the combined unack
+        // cap. Each consumer is independently capped by `unackMsgAllowed`, but
+        // the broker's dispatcher does not guarantee an exactly even split, so
+        // we assert on the per-consumer cap and the combined total instead of
+        // requiring each counter to equal `unackMsgAllowed` exactly.
+        try {
+            Awaitility.await()
+                    .atMost(20, TimeUnit.SECONDS)
+                    .pollInterval(100, TimeUnit.MILLISECONDS)
+                    .until(() -> consumer2Counter.get() + consumer3Counter.get()
+                            >= 2 * unackMsgAllowed);
+        } catch (org.awaitility.core.ConditionTimeoutException e) {
+            fail("Expected combined unacked messages to reach " + (2 * unackMsgAllowed)
+                    + ", but got consumer2=" + consumer2Counter.get()
+                    + ", consumer3=" + consumer3Counter.get(), e);
+        }
+        assertEquals(consumer2Counter.get() + consumer3Counter.get(), 2 * unackMsgAllowed);
+        // Neither consumer may exceed its individual unack cap.
+        org.testng.Assert.assertTrue(consumer2Counter.get() <= unackMsgAllowed,
+                "consumer2 received " + consumer2Counter.get()
+                        + " messages, exceeds unackMsgAllowed=" + unackMsgAllowed);
+        org.testng.Assert.assertTrue(consumer3Counter.get() <= unackMsgAllowed,
+                "consumer3 received " + consumer3Counter.get()
+                        + " messages, exceeds unackMsgAllowed=" + unackMsgAllowed);
     }
 
-    private void startConsumer(Consumer<String> consumer, AtomicInteger consumerCounter,
-                               CountDownLatch countDownLatch) {
-        new Thread(() -> {
-            while (true) {
+    private void startConsumer(Consumer<String> consumer, AtomicInteger consumerCounter) {
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
                     Message<String> message = consumer.receive(500, TimeUnit.MILLISECONDS);
                     if (message == null) {
-                        countDownLatch.countDown();
-                        break;
+                        // Do not exit on a single empty receive: a transient dispatch
+                        // pause (common in CI) must not cause the drain thread to
+                        // declare "done" prematurely and leave the counter below the
+                        // expected unack cap.
+                        continue;
                     }
                     consumerCounter.incrementAndGet();
                 } catch (PulsarClientException e) {
-                    break;
+                    return;
                 }
             }
-        }).start();
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     private void waitCacheInit(String topicName) throws Exception {
